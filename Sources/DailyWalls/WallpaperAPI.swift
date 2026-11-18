@@ -1,11 +1,31 @@
 import Foundation
 
+/// Rich metadata saved alongside each downloaded image (see sidecar `.json` files).
+struct WallpaperMetadata: Codable {
+    let fetchedDate: String
+    let source: String
+    let imageUrl: String
+    let fileName: String
+    let title: String?
+    let copyright: String?
+    let description: String?
+    let entityId: String?
+    let spotlightId: String?
+    let copyrightLink: String?
+    let iconHoverText: String?
+    let ctaText: String?
+    let ctaUri: String?
+}
+
 /// A normalised daily wallpaper entry (source-independent)
 struct WallpaperImage {
     let date: String       // yyyy-MM-dd
     let imageUrl: String   // Direct, full image URL
     let title: String?
     let copyright: String?
+    /// Original CDN / Bing filename used when saving under ~/Pictures/ms-wallpapers/
+    let fileName: String
+    let metadata: WallpaperMetadata
 }
 
 // MARK: - Bing HPImageArchive models
@@ -19,6 +39,7 @@ private struct BingImage: Decodable {
     let urlbase: String     // "/th?id=OHR.SomeName_EN-US1234567890"
     let title: String?
     let copyright: String?
+    let copyrightlink: String?
 }
 
 // MARK: - Microsoft Spotlight (arc.msn.com) models
@@ -28,7 +49,8 @@ private struct SpotlightResponse: Decodable {
 }
 
 private struct SpotlightBatch: Decodable {
-    let items: [SpotlightItem]
+    let items: [SpotlightItem]?
+    let errors: [SpotlightAPIErrorItem]?
 }
 
 private struct SpotlightItem: Decodable {
@@ -43,6 +65,30 @@ private struct SpotlightAsset: Decodable {
     let t: String    // "img" | "txt"
     let u: String?   // URL (images only)
     let tx: String?  // Text value (text assets only)
+}
+
+private struct SpotlightAPIErrorItem: Decodable {
+    let code: Int?
+    let msg: String?
+}
+
+private struct SpotlightV4AdPayload: Decodable {
+    let ad: SpotlightV4Ad
+}
+
+private struct SpotlightV4Ad: Decodable {
+    let landscapeImage: SpotlightV4LandscapeImage
+    let title: String?
+    let description: String?
+    let copyright: String?
+    let entityId: String?
+    let iconHoverText: String?
+    let ctaText: String?
+    let ctaUri: String?
+}
+
+private struct SpotlightV4LandscapeImage: Decodable {
+    let asset: String
 }
 
 // MARK: - Unified API client
@@ -110,8 +156,31 @@ final class WallpaperAPI {
 
         // Convert startdate "20260603" → "2026-06-03"
         let date = formatBingDate(first.startdate)
+        let fileName = bingFileName(urlbase: first.urlbase)
+        let metadata = WallpaperMetadata(
+            fetchedDate: date,
+            source: WallpaperSource.bing.rawValue,
+            imageUrl: imageUrl,
+            fileName: fileName,
+            title: first.title,
+            copyright: first.copyright,
+            description: nil,
+            entityId: nil,
+            spotlightId: bingSpotlightId(from: first.urlbase),
+            copyrightLink: first.copyrightlink,
+            iconHoverText: nil,
+            ctaText: nil,
+            ctaUri: nil
+        )
 
-        return WallpaperImage(date: date, imageUrl: imageUrl, title: first.title, copyright: first.copyright)
+        return WallpaperImage(
+            date: date,
+            imageUrl: imageUrl,
+            title: first.title,
+            copyright: first.copyright,
+            fileName: fileName,
+            metadata: metadata
+        )
     }
 
     /// Converts Bing's compact date format "20260603" to "2026-06-03"
@@ -123,12 +192,78 @@ final class WallpaperAPI {
         return "\(y)-\(m)-\(d)"
     }
 
-    // MARK: - Spotlight via arc.msn.com (official)
+    // MARK: - Spotlight (v4 preferred, v3 fallback)
 
-    /// Official Windows Spotlight delivery endpoint.
-    /// pid=338387 is the landscape lock-screen placement.
-    /// lo=80217, disphorzres/vertres=9999 are required for the server to return content.
+    /// Tries Windows 11 Spotlight API v4 (up to 4K, native CDN filenames) first, then v3.
     private func fetchSpotlight() async throws -> WallpaperImage {
+        do {
+            return try await fetchSpotlightV4()
+        } catch {
+            Logger.shared.log("Spotlight API v4 unavailable (\(error.localizedDescription)); falling back to v3.")
+            return try await fetchSpotlightV3()
+        }
+    }
+
+    /// Spotlight API v4 — `fd.api.iris.microsoft.com`, up to 3840×2160.
+    private func fetchSpotlightV4() async throws -> WallpaperImage {
+        let (locale, country) = spotlightLocale
+        let countryCode = country.uppercased()
+        let urlString = "https://fd.api.iris.microsoft.com/v4/api/selection"
+            + "?placement=88000820&bcnt=1&country=\(countryCode)&locale=\(locale)&fmt=json"
+        guard let url = URL(string: urlString) else {
+            throw WallpaperAPIError.invalidURL(urlString)
+        }
+
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        req.setValue("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await URLSession.shared.data(for: req)
+        try validateHTTP(response, source: "Microsoft Spotlight v4")
+
+        let outer = try JSONDecoder().decode(SpotlightResponse.self, from: data)
+        if let errors = outer.batchrsp.errors, !errors.isEmpty {
+            let msg = errors.compactMap(\.msg).joined(separator: "; ")
+            throw WallpaperAPIError.emptyFeed("Microsoft Spotlight v4: \(msg)")
+        }
+        guard let items = outer.batchrsp.items, let firstItem = items.first else {
+            throw WallpaperAPIError.emptyFeed("Microsoft Spotlight v4")
+        }
+        guard let innerData = firstItem.item.data(using: .utf8) else {
+            throw WallpaperAPIError.malformedData("Spotlight v4 inner JSON is not valid UTF-8")
+        }
+        let payload = try JSONDecoder().decode(SpotlightV4AdPayload.self, from: innerData)
+        let ad = payload.ad
+        let imageUrl = ad.landscapeImage.asset
+        let today = todayString()
+        let fileName = fileNameFromImageURL(imageUrl, fallbackStem: ad.entityId ?? today)
+        let metadata = WallpaperMetadata(
+            fetchedDate: today,
+            source: WallpaperSource.spotlight.rawValue,
+            imageUrl: imageUrl,
+            fileName: fileName,
+            title: ad.title,
+            copyright: ad.copyright,
+            description: ad.description,
+            entityId: ad.entityId,
+            spotlightId: spotlightId(fromCTA: ad.ctaUri),
+            copyrightLink: nil,
+            iconHoverText: ad.iconHoverText,
+            ctaText: ad.ctaText,
+            ctaUri: ad.ctaUri
+        )
+
+        return WallpaperImage(
+            date: today,
+            imageUrl: imageUrl,
+            title: ad.title,
+            copyright: ad.copyright,
+            fileName: fileName,
+            metadata: metadata
+        )
+    }
+
+    /// Legacy Spotlight API v3 — `arc.msn.com`, up to 1080p (used when v4 returns no content).
+    private func fetchSpotlightV3() async throws -> WallpaperImage {
         let (locale, country) = spotlightLocale
         let now = ISO8601DateFormatter().string(from: Date())
         let urlString = "https://arc.msn.com/v3/Delivery/Placement"
@@ -144,31 +279,127 @@ final class WallpaperAPI {
         req.setValue("WindowsShellClient/0 (Windows)", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await URLSession.shared.data(for: req)
-        try validateHTTP(response, source: "Microsoft Spotlight")
+        try validateHTTP(response, source: "Microsoft Spotlight v3")
 
-        // items[].item is itself a JSON-encoded string — decode twice
         let outer = try JSONDecoder().decode(SpotlightResponse.self, from: data)
-        guard let firstItem = outer.batchrsp.items.first else {
-            throw WallpaperAPIError.emptyFeed("Microsoft Spotlight")
+        guard let items = outer.batchrsp.items, let firstItem = items.first else {
+            throw WallpaperAPIError.emptyFeed("Microsoft Spotlight v3")
         }
         guard let innerData = firstItem.item.data(using: .utf8) else {
-            throw WallpaperAPIError.malformedData("Spotlight inner JSON is not valid UTF-8")
+            throw WallpaperAPIError.malformedData("Spotlight v3 inner JSON is not valid UTF-8")
         }
         let ad = try JSONDecoder().decode(SpotlightAd.self, from: innerData)
 
         guard let landscapeAsset = ad.ad["image_fullscreen_001_landscape"],
               landscapeAsset.t == "img",
               let imageUrl = landscapeAsset.u else {
-            throw WallpaperAPIError.malformedData("No landscape image asset in Spotlight response")
+            throw WallpaperAPIError.malformedData("No landscape image asset in Spotlight v3 response")
         }
 
-        let title = ad.ad["hs1_title_text"]?.tx
-        let today = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"; return f.string(from: Date()) }()
+        let title = ad.ad["title_text"]?.tx ?? ad.ad["hs1_title_text"]?.tx
+        let copyright = ad.ad["copyright_text"]?.tx
+        let description = collectSpotlightHotspotText(from: ad.ad)
+        let today = todayString()
+        let fileName = fileNameFromImageURL(imageUrl, fallbackStem: today)
+        let ctaUri = ad.ad["title_destination_url"]?.u ?? ad.ad["hs1_destination_url"]?.u
+        let metadata = WallpaperMetadata(
+            fetchedDate: today,
+            source: WallpaperSource.spotlight.rawValue,
+            imageUrl: imageUrl,
+            fileName: fileName,
+            title: title,
+            copyright: copyright,
+            description: description,
+            entityId: nil,
+            spotlightId: spotlightId(fromCTA: ctaUri),
+            copyrightLink: nil,
+            iconHoverText: nil,
+            ctaText: ad.ad["hs1_cta_text"]?.tx,
+            ctaUri: ctaUri
+        )
 
-        return WallpaperImage(date: today, imageUrl: imageUrl, title: title, copyright: nil)
+        return WallpaperImage(
+            date: today,
+            imageUrl: imageUrl,
+            title: title,
+            copyright: copyright,
+            fileName: fileName,
+            metadata: metadata
+        )
     }
 
     // MARK: - Helpers
+
+    private func todayString() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date())
+    }
+
+    private func bingFileName(urlbase: String) -> String {
+        let id = bingImageId(from: urlbase)
+        return "\(id)_UHD.jpg"
+    }
+
+    private func bingImageId(from urlbase: String) -> String {
+        if let components = URLComponents(string: "https://www.bing.com\(urlbase)"),
+           let query = components.queryItems?.first(where: { $0.name == "id" })?.value {
+            return query
+        }
+        return urlbase
+            .replacingOccurrences(of: "/th?id=", with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    private func bingSpotlightId(from urlbase: String) -> String? {
+        let id = bingImageId(from: urlbase)
+        guard id.hasPrefix("OHR.") else { return nil }
+        let withoutPrefix = id.dropFirst(4)
+        if let underscore = withoutPrefix.firstIndex(of: "_") {
+            return String(withoutPrefix[..<underscore])
+        }
+        return String(withoutPrefix)
+    }
+
+    /// Uses the last path component of the image URL (Microsoft CDN names) when available.
+    private func fileNameFromImageURL(_ imageUrl: String, fallbackStem: String) -> String {
+        guard let url = URL(string: imageUrl) else {
+            return sanitizedFileName("\(fallbackStem).jpg")
+        }
+        let last = url.lastPathComponent
+        if !last.isEmpty, last != "/", last.contains(".") {
+            return sanitizedFileName(last)
+        }
+        let ext = url.pathExtension.isEmpty ? "jpg" : url.pathExtension
+        return sanitizedFileName("\(fallbackStem).\(ext)")
+    }
+
+    private func sanitizedFileName(_ name: String) -> String {
+        let invalid = CharacterSet(charactersIn: "/:\\")
+        let cleaned = name.unicodeScalars.map { invalid.contains($0) ? "_" : Character($0) }
+        return String(cleaned).replacingOccurrences(of: "..", with: "_")
+    }
+
+    private func spotlightId(fromCTA uri: String?) -> String? {
+        guard let uri, let url = URL(string: uri.replacingOccurrences(of: "microsoft-edge:", with: "")),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let id = components.queryItems?.first(where: { $0.name == "spotlightid" })?.value else {
+            return nil
+        }
+        return id
+    }
+
+    private func collectSpotlightHotspotText(from ad: [String: SpotlightAsset]) -> String? {
+        var parts: [String] = []
+        let keys = ad.keys.filter { $0.hasSuffix("_title_text") }.sorted()
+        for key in keys {
+            if let text = ad[key]?.tx?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                parts.append(text)
+            }
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: "\n\n")
+    }
 
     private func validateHTTP(_ response: URLResponse, source: String) throws {
         guard let http = response as? HTTPURLResponse, http.statusCode != 200 else { return }

@@ -23,19 +23,19 @@ final class WallpaperManager {
             return
         }
         Logger.shared.log("Triggering wallpaper refresh (daily check).")
-        Task { await performRefresh() }
+        Task { await performRefresh(fetchNewImage: true) }
     }
 
-    /// Always downloads and applies the wallpaper, regardless of cache state.
+    /// Re-applies today's wallpaper to every display and Space, or fetches once if none yet today.
     func forceRefresh() {
         Logger.shared.log("Force refresh requested.")
-        Task { await performRefresh() }
+        Task { await performRefresh(fetchNewImage: false) }
     }
 
     // MARK: - Core Logic
 
     @MainActor
-    private func performRefresh() async {
+    private func performRefresh(fetchNewImage: Bool) async {
         guard !isRefreshing else {
             Logger.shared.log("Refresh already in progress, skipping duplicate trigger.")
             return
@@ -44,6 +44,19 @@ final class WallpaperManager {
         defer { isRefreshing = false }
 
         let source = Preferences.shared.source
+        let today = Preferences.shared.todayString()
+
+        if !fetchNewImage, let reapplyURL = lastAppliedImageURLForToday(source: source) {
+            Logger.shared.log("Re-applying today's wallpaper to all displays and Spaces: \(reapplyURL.path)")
+            do {
+                try applyWallpaper(fileURL: reapplyURL)
+                Logger.shared.log("Wallpaper re-applied successfully.")
+            } catch {
+                Logger.shared.log("ERROR: \(error.localizedDescription)")
+            }
+            return
+        }
+
         let sourceName = source == .spotlight ? "Microsoft Spotlight" : "Bing (official)"
         Logger.shared.log("Fetching \(sourceName) wallpaper...")
 
@@ -52,21 +65,36 @@ final class WallpaperManager {
             let credit = image.copyright.map { " — \($0)" } ?? ""
             Logger.shared.log("Got image for \(image.date): \(image.title ?? "(no title)")\(credit)")
 
-            // 2. Download image file
             let localURL = try await downloadImage(image: image, source: source)
             Logger.shared.log("Image saved to \(localURL.path)")
+            try writeMetadataSidecar(for: image, imageFileURL: localURL)
 
-            // 3. Apply to all screens + spaces
             try applyWallpaper(fileURL: localURL)
             Logger.shared.log("Wallpaper applied successfully to all screens.")
 
-            // 4. Record date
-            Preferences.shared.lastAppliedDate = Preferences.shared.todayString()
+            recordSuccessfulApply(fileURL: localURL, source: source, date: today)
 
         } catch {
-
             Logger.shared.log("ERROR: \(error.localizedDescription)")
         }
+    }
+
+    private func lastAppliedImageURLForToday(source: WallpaperSource) -> URL? {
+        let prefs = Preferences.shared
+        guard prefs.isUpToDateForToday,
+              prefs.lastAppliedSource == source,
+              let path = prefs.lastAppliedImagePath,
+              fileManager.fileExists(atPath: path) else {
+            return nil
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    private func recordSuccessfulApply(fileURL: URL, source: WallpaperSource, date: String) {
+        let prefs = Preferences.shared
+        prefs.lastAppliedDate = date
+        prefs.lastAppliedImagePath = fileURL.standardizedFileURL.path
+        prefs.lastAppliedSource = source
     }
 
     // MARK: - Download
@@ -76,15 +104,10 @@ final class WallpaperManager {
             throw WallpaperError.invalidImageURL(image.imageUrl)
         }
 
-        // Determine file extension
-        let ext = remoteURL.pathExtension.isEmpty ? "jpg" : remoteURL.pathExtension
-
-        // Build save path: ~/Pictures/ms-wallpapers/{bing|spotlight}/{yyyy-mm-dd}.{ext}
         let destDir = picturesDir.appendingPathComponent(source.rawValue)
         try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
-        let destFile = destDir.appendingPathComponent("\(image.date).\(ext)")
+        let destFile = destDir.appendingPathComponent(image.fileName)
 
-        // Return cached file if already downloaded today
         if fileManager.fileExists(atPath: destFile.path) {
             Logger.shared.log("Using cached image at \(destFile.path)")
             return destFile
@@ -97,7 +120,6 @@ final class WallpaperManager {
             throw WallpaperError.downloadFailed("HTTP \(httpResponse.statusCode)")
         }
 
-        // Move from temp to destination
         if fileManager.fileExists(atPath: destFile.path) {
             try fileManager.removeItem(at: destFile)
         }
@@ -106,48 +128,89 @@ final class WallpaperManager {
         return destFile
     }
 
+    private func writeMetadataSidecar(for image: WallpaperImage, imageFileURL: URL) throws {
+        let sidecarURL = imageFileURL.deletingPathExtension().appendingPathExtension("json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(image.metadata)
+        try data.write(to: sidecarURL, options: .atomic)
+        Logger.shared.log("Metadata saved to \(sidecarURL.path)")
+    }
+
     // MARK: - Apply Wallpaper
 
     private func applyWallpaper(fileURL: URL) throws {
+        let resolved = fileURL.standardizedFileURL
         let workspace = NSWorkspace.shared
         var errors: [Error] = []
 
-        // Apply to every connected screen (covers the active space on each display)
         for screen in NSScreen.screens {
             do {
-                // Using empty options dict — NSWorkspace will use the existing display options
-                try workspace.setDesktopImageURL(fileURL, for: screen, options: [:])
+                try workspace.setDesktopImageURL(
+                    resolved,
+                    for: screen,
+                    options: [
+                        .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
+                        .allowClipping: true,
+                    ]
+                )
             } catch {
                 errors.append(error)
                 Logger.shared.log("Warning: failed to set wallpaper on screen '\(screen.localizedName)': \(error.localizedDescription)")
             }
         }
 
-        // Also use osascript as a belt-and-suspenders approach to cover all Spaces
-        applyViaAppleScript(fileURL: fileURL)
+        applyWallpaperToAllSpaces(fileURL: resolved)
 
-        if errors.count == NSScreen.screens.count {
+        if errors.count == NSScreen.screens.count, NSScreen.screens.isEmpty == false {
             throw WallpaperError.allScreensFailed
         }
     }
 
-    /// Uses AppleScript to set the wallpaper on every desktop/space (works across inactive spaces).
-    private func applyViaAppleScript(fileURL: URL) {
-        let posixPath = fileURL.path
-        let script = """
-        tell application "System Events"
-            set theDesktops to every desktop
-            repeat with aDesktop in theDesktops
-                set picture of aDesktop to "\(posixPath.replacingOccurrences(of: "\"", with: "\\\""))"
-            end repeat
-        end tell
-        """
+    /// Sets the same image on every Mission Control Space (including inactive desktops).
+    private func applyWallpaperToAllSpaces(fileURL: URL) {
+        let escaped = appleScriptEscapedPath(fileURL.path)
 
+        runAppleScript("""
+        tell application "System Events"
+            try
+                set picture of every desktop to "\(escaped)"
+            end try
+        end tell
+        """, label: "System Events (every desktop)")
+
+        runAppleScript("""
+        tell application "System Events"
+            try
+                repeat with d in desktops
+                    set picture of d to "\(escaped)"
+                end repeat
+            end try
+        end tell
+        """, label: "System Events (per desktop)")
+
+        runAppleScript("""
+        tell application "Finder"
+            try
+                set desktop picture to POSIX file "\(escaped)"
+            end try
+        end tell
+        """, label: "Finder")
+    }
+
+    private func appleScriptEscapedPath(_ path: String) -> String {
+        path.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private func runAppleScript(_ source: String, label: String) {
         var error: NSDictionary?
-        if let appleScript = NSAppleScript(source: script) {
+        if let appleScript = NSAppleScript(source: source) {
             appleScript.executeAndReturnError(&error)
             if let err = error {
-                Logger.shared.log("AppleScript warning: \(err)")
+                Logger.shared.log("AppleScript (\(label)) warning: \(err)")
+            } else {
+                Logger.shared.log("AppleScript (\(label)) completed.")
             }
         }
     }

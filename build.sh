@@ -7,6 +7,7 @@
 #   ./build.sh --arch x86_64          — build for Intel
 #   ./build.sh install                — build + copy to /Applications
 #   ./build.sh --arch arm64 install   — build arm64 + copy to /Applications
+#   ./build.sh install --no-launch      — install without opening the app
 # =============================================================================
 set -euo pipefail
 
@@ -17,6 +18,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Parse arguments: optional --arch <arm64|x86_64> and optional "install"
 ARCH=""
 INSTALL=false
+NO_LAUNCH=false
 TAKE_ARCH=false
 for arg in "$@"; do
     if [[ "$TAKE_ARCH" == true ]]; then
@@ -26,6 +28,8 @@ for arg in "$@"; do
         TAKE_ARCH=true
     elif [[ "$arg" == "install" ]]; then
         INSTALL=true
+    elif [[ "$arg" == "--no-launch" ]]; then
+        NO_LAUNCH=true
     fi
 done
 
@@ -112,7 +116,9 @@ if [[ "$INSTALL" == true ]]; then
     echo "    First launch: right-click → Open (Gatekeeper requires this once for ad-hoc signed apps)"
     echo "    Or run:  open /Applications/${BUNDLE_NAME}"
     echo ""
-    open "${INSTALL_PATH}"
+    if [[ "$NO_LAUNCH" != true ]]; then
+        open "${INSTALL_PATH}"
+    fi
 fi
 
 echo "==> Done."

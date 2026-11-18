@@ -106,7 +106,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func selectBing() {
         Logger.shared.log("Source switched to Bing.")
         Preferences.shared.source = .bing
-        Preferences.shared.lastAppliedDate = nil  // Force re-download with new source
+        Preferences.shared.clearLastAppliedWallpaper()  // Force re-download with new source
         updateSourceCheckmarks()
         WallpaperManager.shared.forceRefresh()
     }
@@ -114,7 +114,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func selectSpotlight() {
         Logger.shared.log("Source switched to Spotlight.")
         Preferences.shared.source = .spotlight
-        Preferences.shared.lastAppliedDate = nil
+        Preferences.shared.clearLastAppliedWallpaper()
         updateSourceCheckmarks()
         WallpaperManager.shared.forceRefresh()
     }
