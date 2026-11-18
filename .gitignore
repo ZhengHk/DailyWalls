@@ -3,3 +3,7 @@
 DailyWalls.app/
 .antigravitycli/
 DerivedData/
+
+# Editor / local tooling (never commit)
+.cursor/
+.cursorrules
