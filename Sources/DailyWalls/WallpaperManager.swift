@@ -12,12 +12,17 @@ final class WallpaperManager {
     private var pickerController: SpotlightPickerWindowController?
     private var spaceChangeDebounce: DispatchWorkItem?
     private var spaceObserverRegistered = false
+    /// Spotlight files downloaded for the open picker session (exempt until dismiss/reroll).
+    private var pickerSessionPaths: Set<String> = []
 
     private init() {
         let home = fileManager.homeDirectoryForCurrentUser
         picturesDir = home.appendingPathComponent("Pictures/ms-wallpapers")
         Preferences.shared.migrateLegacyKeysIfNeeded()
         registerActiveSpaceObserver()
+        Task { @MainActor in
+            pruneAllFeedCaches()
+        }
     }
 
     var savedFavoritesDirectory: URL {
@@ -164,6 +169,7 @@ final class WallpaperManager {
             Preferences.shared.source = .bing
         }
         Logger.shared.log("Wallpaper applied successfully.")
+        pruneFeedCache(source, retainPickerSession: false)
     }
 
     private func recordCurrentWallpaper(fileURL: URL) {
@@ -189,7 +195,12 @@ final class WallpaperManager {
                 Task { await self?.reloadSpotlightPicker() }
             }
             controller.onDismiss = { [weak self] in
-                self?.pickerController = nil
+                guard let self else { return }
+                self.pickerSessionPaths = []
+                self.pickerController = nil
+                Task { @MainActor in
+                    self.pruneFeedCache(.spotlight, retainPickerSession: false)
+                }
             }
             pickerController = controller
         }
@@ -200,6 +211,8 @@ final class WallpaperManager {
 
     @MainActor
     private func reloadSpotlightPicker() async {
+        pickerSessionPaths = []
+        pruneFeedCache(.spotlight, retainPickerSession: false)
         pickerController?.showLoading("Fetching new Spotlight images…")
         do {
             let entries = try await buildPickerEntries()
@@ -212,11 +225,17 @@ final class WallpaperManager {
     private func buildPickerEntries() async throws -> [SpotlightPickerEntry] {
         let images = try await WallpaperAPI.shared.fetchSpotlightOptions(count: 4)
         var entries: [SpotlightPickerEntry] = []
+        var sessionPaths = Set<String>()
         for image in images {
             let localURL = try await downloadImage(image: image, source: .spotlight)
             try writeMetadataSidecar(for: image, imageFileURL: localURL)
+            sessionPaths.insert(localURL.standardizedFileURL.path)
             guard let preview = NSImage(contentsOf: localURL) else { continue }
             entries.append(SpotlightPickerEntry(image: image, localURL: localURL, preview: preview))
+        }
+        let pathsForSession = sessionPaths
+        await MainActor.run {
+            self.pickerSessionPaths = pathsForSession
         }
         return entries
     }
@@ -228,10 +247,94 @@ final class WallpaperManager {
             Preferences.shared.setStoredImagePath(entry.localURL.path, for: .spotlight)
             Preferences.shared.source = .spotlight
             recordCurrentWallpaper(fileURL: entry.localURL)
+            pickerSessionPaths = []
+            pruneFeedCache(.spotlight, retainPickerSession: false)
             Logger.shared.log("Applied Spotlight pick: \(entry.image.title ?? entry.image.fileName)")
         } catch {
             Logger.shared.log("ERROR: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Cache prune
+
+    /// Removes unpicked downloads in `bing/` and `spotlight/`; never touches `saved/`.
+    @MainActor
+    private func pruneAllFeedCaches() {
+        for source in WallpaperSource.allCases {
+            pruneFeedCache(source, retainPickerSession: false)
+        }
+    }
+
+    /// Keeps: current wallpaper, each feed's last chosen image, and (optional) open picker batch.
+    @MainActor
+    private func pruneFeedCache(_ source: WallpaperSource, retainPickerSession: Bool) {
+        let feedDir = picturesDir.appendingPathComponent(source.rawValue)
+        guard fileManager.fileExists(atPath: feedDir.path) else { return }
+
+        var protected = protectedCachePaths()
+        if retainPickerSession {
+            protected.formUnion(pickerSessionPaths)
+        }
+
+        guard let files = try? fileManager.contentsOfDirectory(
+            at: feedDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        var removed = 0
+        for file in files {
+            if isCacheFileProtected(file, protected: protected) { continue }
+
+            try? fileManager.removeItem(at: file)
+            removed += 1
+
+            let json = file.deletingPathExtension().appendingPathExtension("json")
+            if file.pathExtension.lowercased() != "json",
+               fileManager.fileExists(atPath: json.path),
+               !isCacheFileProtected(json, protected: protected) {
+                try? fileManager.removeItem(at: json)
+                removed += 1
+            }
+        }
+
+        if removed > 0 {
+            Logger.shared.log("Pruned \(removed) unneeded file(s) from ms-wallpapers/\(source.rawValue)/")
+        }
+    }
+
+    private func protectedCachePaths() -> Set<String> {
+        let prefs = Preferences.shared
+        var paths = Set<String>()
+
+        func add(_ path: String?) {
+            guard let path, fileManager.fileExists(atPath: path) else { return }
+            paths.insert(URL(fileURLWithPath: path).standardizedFileURL.path)
+        }
+
+        add(prefs.currentWallpaperPath)
+        if let custom = prefs.customImagePath,
+           custom.hasPrefix(picturesDir.path) {
+            add(custom)
+        }
+        for source in WallpaperSource.allCases {
+            add(prefs.storedImagePath(for: source))
+        }
+        return paths
+    }
+
+    private func isCacheFileProtected(_ url: URL, protected: Set<String>) -> Bool {
+        let path = url.standardizedFileURL.path
+        if protected.contains(path) { return true }
+
+        if url.pathExtension.lowercased() == "json" {
+            let base = url.deletingPathExtension()
+            for ext in ["jpg", "jpeg", "png", "heic", "webp"] {
+                let candidate = base.appendingPathExtension(ext).standardizedFileURL.path
+                if protected.contains(candidate) { return true }
+            }
+        }
+        return false
     }
 
     // MARK: - Favorites
