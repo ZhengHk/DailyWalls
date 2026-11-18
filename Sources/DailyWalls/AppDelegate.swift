@@ -5,13 +5,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var bingMenuItem: NSMenuItem!
     private var spotlightMenuItem: NSMenuItem!
+    private var pauseMenuItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Logger.shared.log("DailyWalls started.")
 
         setupStatusItem()
         registerSystemObservers()
-        // Trigger a check on launch (e.g. if the app was manually re-opened)
+
+        WallpaperManager.shared.reapplyCurrentWallpaper()
         WallpaperManager.shared.refreshIfNeeded()
     }
 
@@ -21,13 +23,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem.button {
-            // Try bundled icon first, fall back to SF Symbol
             if let iconImage = loadMenuBarIcon() {
                 button.image = iconImage
             } else {
                 button.image = NSImage(systemSymbolName: "photo.on.rectangle.angled", accessibilityDescription: "Wallpaper Rotation")
             }
-            button.image?.isTemplate = true  // Adapts to dark/light menu bar automatically
+            button.image?.isTemplate = true
             button.toolTip = "DailyWalls"
         }
 
@@ -37,7 +38,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func loadMenuBarIcon() -> NSImage? {
         guard let url = Bundle.module.url(forResource: "menubar_icon", withExtension: "png"),
               let image = NSImage(contentsOf: url) else { return nil }
-        // Scale to standard menu bar height (18pt)
         let size = NSSize(width: 18, height: 18)
         let resized = NSImage(size: size)
         resized.lockFocus()
@@ -51,19 +51,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
 
-        // Source selection — mutually exclusive
-        bingMenuItem = NSMenuItem(
-            title: "Bing",
-            action: #selector(selectBing),
-            keyEquivalent: ""
-        )
+        bingMenuItem = NSMenuItem(title: "Bing", action: #selector(selectBing), keyEquivalent: "")
         bingMenuItem.target = self
 
-        spotlightMenuItem = NSMenuItem(
-            title: "Spotlight",
-            action: #selector(selectSpotlight),
-            keyEquivalent: ""
-        )
+        spotlightMenuItem = NSMenuItem(title: "Spotlight", action: #selector(selectSpotlight), keyEquivalent: "")
         spotlightMenuItem.target = self
 
         updateSourceCheckmarks()
@@ -72,23 +63,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(spotlightMenuItem)
         menu.addItem(NSMenuItem.separator())
 
-        // Refresh Now
-        let refreshItem = NSMenuItem(
-            title: "Refresh Now",
-            action: #selector(refreshNow),
+        let pickSpotlightItem = NSMenuItem(
+            title: "Pick Spotlight Image…",
+            action: #selector(pickSpotlight),
+            keyEquivalent: ""
+        )
+        pickSpotlightItem.target = self
+        menu.addItem(pickSpotlightItem)
+
+        let reapplyItem = NSMenuItem(
+            title: "Re-apply Wallpaper",
+            action: #selector(reapplyWallpaper),
             keyEquivalent: "r"
         )
-        refreshItem.target = self
-        menu.addItem(refreshItem)
+        reapplyItem.target = self
+        menu.addItem(reapplyItem)
+
+        let chooseItem = NSMenuItem(
+            title: "Choose Image from File…",
+            action: #selector(chooseImage),
+            keyEquivalent: "o"
+        )
+        chooseItem.target = self
+        menu.addItem(chooseItem)
+
+        let favoriteItem = NSMenuItem(
+            title: "★ Favorite Current Wallpaper",
+            action: #selector(favoriteCurrent),
+            keyEquivalent: ""
+        )
+        favoriteItem.target = self
+        menu.addItem(favoriteItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // Exit
-        let exitItem = NSMenuItem(
-            title: "Exit",
-            action: #selector(exitApp),
-            keyEquivalent: "q"
+        pauseMenuItem = NSMenuItem(
+            title: "Pause Daily Auto-Change",
+            action: #selector(togglePause),
+            keyEquivalent: ""
         )
+        pauseMenuItem.target = self
+        updatePauseCheckmark()
+        menu.addItem(pauseMenuItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let exitItem = NSMenuItem(title: "Exit", action: #selector(exitApp), keyEquivalent: "q")
         exitItem.target = self
         menu.addItem(exitItem)
 
@@ -101,27 +121,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         spotlightMenuItem.state = (current == .spotlight) ? .on : .off
     }
 
+    private func updatePauseCheckmark() {
+        pauseMenuItem.state = Preferences.shared.dailyAutoPaused ? .on : .off
+    }
+
     // MARK: - Menu Actions
 
     @objc private func selectBing() {
         Logger.shared.log("Source switched to Bing.")
         Preferences.shared.source = .bing
-        Preferences.shared.clearLastAppliedWallpaper()  // Force re-download with new source
         updateSourceCheckmarks()
-        WallpaperManager.shared.forceRefresh()
+        WallpaperManager.shared.activateSource(.bing)
     }
 
     @objc private func selectSpotlight() {
         Logger.shared.log("Source switched to Spotlight.")
         Preferences.shared.source = .spotlight
-        Preferences.shared.clearLastAppliedWallpaper()
         updateSourceCheckmarks()
-        WallpaperManager.shared.forceRefresh()
+        WallpaperManager.shared.activateSource(.spotlight)
     }
 
-    @objc private func refreshNow() {
-        Logger.shared.log("Refresh Now clicked.")
-        WallpaperManager.shared.forceRefresh()
+    @objc private func pickSpotlight() {
+        Logger.shared.log("Pick Spotlight Image requested.")
+        WallpaperManager.shared.presentSpotlightPicker()
+    }
+
+    @objc private func reapplyWallpaper() {
+        Logger.shared.log("Re-apply wallpaper requested.")
+        WallpaperManager.shared.reapplyCurrentWallpaper()
+    }
+
+    @objc private func chooseImage() {
+        Logger.shared.log("Choose image from file requested.")
+        WallpaperManager.shared.chooseWallpaperFromFile()
+    }
+
+    @objc private func favoriteCurrent() {
+        Logger.shared.log("Favorite current wallpaper requested.")
+        WallpaperManager.shared.favoriteCurrentWallpaper()
+    }
+
+    @objc private func togglePause() {
+        Preferences.shared.dailyAutoPaused.toggle()
+        updatePauseCheckmark()
+        Logger.shared.log(Preferences.shared.dailyAutoPaused ? "Daily auto-change paused." : "Daily auto-change resumed.")
     }
 
     @objc private func exitApp() {
@@ -134,7 +177,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func registerSystemObservers() {
         let wsCenter = NSWorkspace.shared.notificationCenter
 
-        // System wake from sleep
         wsCenter.addObserver(
             self,
             selector: #selector(systemDidWake),
@@ -142,7 +184,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        // Screen unlock (e.g. after password prompt)
         DistributedNotificationCenter.default().addObserver(
             self,
             selector: #selector(screenDidUnlock),
@@ -153,12 +194,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func systemDidWake(_ notification: Notification) {
         Logger.shared.log("System woke from sleep.")
+        WallpaperManager.shared.reapplyCurrentWallpaper()
         WallpaperManager.shared.refreshIfNeeded()
     }
 
     @objc private func screenDidUnlock(_ notification: Notification) {
         Logger.shared.log("Screen unlocked.")
+        WallpaperManager.shared.reapplyCurrentWallpaper()
         WallpaperManager.shared.refreshIfNeeded()
     }
-
 }

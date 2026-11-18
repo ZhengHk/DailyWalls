@@ -1,7 +1,7 @@
 import Foundation
 
-/// Which wallpaper source is selected
-enum WallpaperSource: String {
+/// Which wallpaper feed drives daily auto-change (mutually exclusive in the menu).
+enum WallpaperSource: String, CaseIterable {
     case bing = "bing"
     case spotlight = "spotlight"
 }
@@ -12,13 +12,21 @@ final class Preferences {
 
     private let defaults = UserDefaults.standard
     private let sourceKey = "wallpaperSource"
-    private let lastAppliedDateKey = "lastAppliedDate"
-    private let lastAppliedImagePathKey = "lastAppliedImagePath"
-    private let lastAppliedSourceKey = "lastAppliedSource"
+    private let dailyAutoPausedKey = "dailyAutoPaused"
+    private let customImagePathKey = "customImagePath"
+    private let currentWallpaperPathKey = "currentWallpaperPath"
+
+    private func storedPathKey(for source: WallpaperSource) -> String {
+        "storedImagePath.\(source.rawValue)"
+    }
+
+    private func lastAutoDateKey(for source: WallpaperSource) -> String {
+        "lastAutoApplyDate.\(source.rawValue)"
+    }
 
     private init() {}
 
-    /// Selected wallpaper source (default: .bing)
+    /// Feed used for daily automatic updates (Bing or Spotlight).
     var source: WallpaperSource {
         get {
             let raw = defaults.string(forKey: sourceKey) ?? WallpaperSource.bing.rawValue
@@ -29,37 +37,41 @@ final class Preferences {
         }
     }
 
-    /// The last date a wallpaper was successfully applied (yyyy-MM-dd string)
-    var lastAppliedDate: String? {
-        get { defaults.string(forKey: lastAppliedDateKey) }
-        set { defaults.set(newValue, forKey: lastAppliedDateKey) }
+    var dailyAutoPaused: Bool {
+        get { defaults.bool(forKey: dailyAutoPausedKey) }
+        set { defaults.set(newValue, forKey: dailyAutoPausedKey) }
     }
 
-    /// Absolute path to the image file last applied successfully (for same-day re-apply).
-    var lastAppliedImagePath: String? {
-        get { defaults.string(forKey: lastAppliedImagePathKey) }
-        set { defaults.set(newValue, forKey: lastAppliedImagePathKey) }
+    /// Last manually chosen file (outside Bing / Spotlight caches).
+    var customImagePath: String? {
+        get { defaults.string(forKey: customImagePathKey) }
+        set { defaults.set(newValue, forKey: customImagePathKey) }
     }
 
-    /// Source that produced `lastAppliedImagePath`.
-    var lastAppliedSource: WallpaperSource? {
-        get {
-            guard let raw = defaults.string(forKey: lastAppliedSourceKey) else { return nil }
-            return WallpaperSource(rawValue: raw)
-        }
-        set {
-            if let newValue {
-                defaults.set(newValue.rawValue, forKey: lastAppliedSourceKey)
-            } else {
-                defaults.removeObject(forKey: lastAppliedSourceKey)
-            }
-        }
+    /// Most recently applied wallpaper (any origin) — used on wake / re-apply.
+    var currentWallpaperPath: String? {
+        get { defaults.string(forKey: currentWallpaperPathKey) }
+        set { defaults.set(newValue, forKey: currentWallpaperPathKey) }
     }
 
-    /// Returns true if wallpaper was already applied today
-    var isUpToDateForToday: Bool {
-        let today = todayString()
-        return lastAppliedDate == today
+    func storedImagePath(for source: WallpaperSource) -> String? {
+        defaults.string(forKey: storedPathKey(for: source))
+    }
+
+    func setStoredImagePath(_ path: String?, for source: WallpaperSource) {
+        defaults.set(path, forKey: storedPathKey(for: source))
+    }
+
+    func lastAutoApplyDate(for source: WallpaperSource) -> String? {
+        defaults.string(forKey: lastAutoDateKey(for: source))
+    }
+
+    func setLastAutoApplyDate(_ date: String?, for source: WallpaperSource) {
+        defaults.set(date, forKey: lastAutoDateKey(for: source))
+    }
+
+    func isUpToDateForToday(source: WallpaperSource) -> Bool {
+        lastAutoApplyDate(for: source) == todayString()
     }
 
     func todayString() -> String {
@@ -68,9 +80,22 @@ final class Preferences {
         return fmt.string(from: Date())
     }
 
-    func clearLastAppliedWallpaper() {
-        lastAppliedDate = nil
-        lastAppliedImagePath = nil
-        lastAppliedSource = nil
+    /// One-time migration from older single-path preferences.
+    func migrateLegacyKeysIfNeeded() {
+        guard defaults.string(forKey: "lastAppliedImagePath") != nil else { return }
+        if let path = defaults.string(forKey: "lastAppliedImagePath"),
+           let raw = defaults.string(forKey: "lastAppliedSource"),
+           let legacySource = WallpaperSource(rawValue: raw) {
+            if storedImagePath(for: legacySource) == nil {
+                setStoredImagePath(path, for: legacySource)
+            }
+            if let date = defaults.string(forKey: "lastAppliedDate") {
+                setLastAutoApplyDate(date, for: legacySource)
+            }
+            currentWallpaperPath = path
+        }
+        defaults.removeObject(forKey: "lastAppliedImagePath")
+        defaults.removeObject(forKey: "lastAppliedSource")
+        defaults.removeObject(forKey: "lastAppliedDate")
     }
 }

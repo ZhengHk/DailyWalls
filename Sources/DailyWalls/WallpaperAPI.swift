@@ -125,6 +125,18 @@ final class WallpaperAPI {
         }
     }
 
+    /// Up to four Spotlight candidates for the picker (`bcnt` on API v4).
+    func fetchSpotlightOptions(count: Int = 4) async throws -> [WallpaperImage] {
+        let batch = min(max(count, 1), 4)
+        do {
+            let images = try await fetchSpotlightV4Batch(count: batch)
+            if !images.isEmpty { return images }
+        } catch {
+            Logger.shared.log("Spotlight batch v4 failed (\(error.localizedDescription)); falling back.")
+        }
+        return [try await fetchSpotlightV3()]
+    }
+
     // MARK: - Bing via HPImageArchive (official)
 
     /// Uses the same JSON endpoint that Bing.com itself uses to populate its homepage.
@@ -206,10 +218,18 @@ final class WallpaperAPI {
 
     /// Spotlight API v4 — `fd.api.iris.microsoft.com`, up to 3840×2160.
     private func fetchSpotlightV4() async throws -> WallpaperImage {
+        let images = try await fetchSpotlightV4Batch(count: 1)
+        guard let first = images.first else {
+            throw WallpaperAPIError.emptyFeed("Microsoft Spotlight v4")
+        }
+        return first
+    }
+
+    private func fetchSpotlightV4Batch(count: Int) async throws -> [WallpaperImage] {
         let (locale, country) = spotlightLocale
         let countryCode = country.uppercased()
         let urlString = "https://fd.api.iris.microsoft.com/v4/api/selection"
-            + "?placement=88000820&bcnt=1&country=\(countryCode)&locale=\(locale)&fmt=json"
+            + "?placement=88000820&bcnt=\(count)&country=\(countryCode)&locale=\(locale)&fmt=json"
         guard let url = URL(string: urlString) else {
             throw WallpaperAPIError.invalidURL(urlString)
         }
@@ -225,12 +245,24 @@ final class WallpaperAPI {
             let msg = errors.compactMap(\.msg).joined(separator: "; ")
             throw WallpaperAPIError.emptyFeed("Microsoft Spotlight v4: \(msg)")
         }
-        guard let items = outer.batchrsp.items, let firstItem = items.first else {
+        guard let items = outer.batchrsp.items, !items.isEmpty else {
             throw WallpaperAPIError.emptyFeed("Microsoft Spotlight v4")
         }
-        guard let innerData = firstItem.item.data(using: .utf8) else {
-            throw WallpaperAPIError.malformedData("Spotlight v4 inner JSON is not valid UTF-8")
+
+        var seen = Set<String>()
+        var result: [WallpaperImage] = []
+        for item in items {
+            guard let innerData = item.item.data(using: .utf8) else { continue }
+            guard let image = try? wallpaperImageFromSpotlightV4(innerData: innerData) else { continue }
+            let key = image.metadata.entityId ?? image.fileName
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            result.append(image)
         }
+        return result
+    }
+
+    private func wallpaperImageFromSpotlightV4(innerData: Data) throws -> WallpaperImage {
         let payload = try JSONDecoder().decode(SpotlightV4AdPayload.self, from: innerData)
         let ad = payload.ad
         let imageUrl = ad.landscapeImage.asset
@@ -251,7 +283,6 @@ final class WallpaperAPI {
             ctaText: ad.ctaText,
             ctaUri: ad.ctaUri
         )
-
         return WallpaperImage(
             date: today,
             imageUrl: imageUrl,
